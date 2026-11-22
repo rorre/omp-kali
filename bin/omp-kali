@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+import os
+import shutil
+import sys
+from pathlib import Path
+
+repo = Path(__file__).resolve().parents[1]
+uv = shutil.which("uv")
+if uv:
+    os.execv(uv, [uv, "run", "--project", str(repo), "omp-kali", *sys.argv[1:]])
+
+sys.path.insert(0, str(repo / "src"))
+try:
+    from omp_kali.cli import main
+except ModuleNotFoundError as exc:  # pragma: no cover - only when uv is absent
+    raise SystemExit(
+        f"omp-kali needs uv or an installed environment (missing {exc.name!r}). "
+        "Install uv: https://docs.astral.sh/uv/"
+    ) from exc
+
+raise SystemExit(main())

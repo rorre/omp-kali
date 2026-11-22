@@ -1,0 +1,18 @@
+Agents are frontmatter Markdown files: agents/<name>.md.
+
+A valid agent requires name, description, and a system prompt body:
+
+---
+name: reviewer
+description: Review a change for correctness.
+---
+
+Review the assigned change and report concrete findings.
+
+OMP also accepts optional fields such as model, tools, spawns, thinking-level,
+structured, and autoloadSkills. Project agents are discovered from
+~/.omp/agent/agents (linked to this directory) and .omp/agents in the working
+project.
+
+This README intentionally has no .md extension so it is not parsed as an agent.
+OMP only loads *.md files from this directory.

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omp-kali"
+version = "0.1.0"
+description = "Run an isolated omp instance inside a Kali Linux distrobox"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["typer>=0.29.0"]
+
+[project.scripts]
+omp-kali = "omp_kali.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv]
+# The checkout is the project root; editable installs keep paths.repo_root() valid.
+package = true
