@@ -11,8 +11,9 @@ from typing import Any, List, Optional
 import typer
 
 from . import __version__, paths
-from .container import CONTAINER, Container, Runner, container_workdir
+from .container import CONTAINER, Container, container_workdir
 from .errors import OmpKaliError
+from .podman import RealPodman, Runner
 from .mcp import load_manifests
 from .ports import (
     DEFAULT_BIND,
@@ -436,7 +437,7 @@ def _warn_loopback(mapping: PortMapping) -> None:
 
 def _load_container(opts: CommonOptions) -> tuple[Container, dict[str, Any]]:
     runner = Runner(dry_run=opts.dry_run, verbose=opts.verbose)
-    return Container(runner), paths.load_state()
+    return Container(RealPodman(runner)), paths.load_state()
 
 
 def _ensure_and_run(

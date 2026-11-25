@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -16,19 +17,23 @@ from . import paths, provisioning
 from .errors import OmpKaliError
 from .mcp import McpManifest, load_config as load_mcp_config
 from .mcp import load_manifests, merge_servers, write_config as write_mcp_config
+from .podman import (
+    CONTAINER,
+    GUI_LABEL,
+    MANAGED_LABEL,
+    PODMAN,
+    VOLUME,
+    WORKSPACE_LABEL,
+    ContainerFacts,
+    Podman,
+)
 from .ports import PortMapping, desired_publish_specs, mappings_from_state, relay_payloads
 from .util import confirm, eprint, shjoin
 
-CONTAINER = "omp-kali"
 BASE_IMAGE = "docker.io/kalilinux/kali-rolling:latest"
 IMAGE_REPO = "localhost/omp-kali"
-VOLUME = "omp-kali-home"
 CONTAINER_HOME = "/home/omp"
 WORKSPACE_ROOT = "/workspace"
-MANAGED_LABEL = "omp-kali.managed"
-WORKSPACE_LABEL = "omp-kali.workspace"
-GUI_LABEL = "omp-kali.gui"
-PODMAN = "podman"
 
 
 def container_workdir(cwd: Path) -> Path:
@@ -106,77 +111,35 @@ def _gui_mounts() -> list[str]:
     return mounts
 
 
-class Runner:
-    def __init__(self, *, dry_run: bool = False, verbose: bool = False) -> None:
-        self.dry_run = dry_run
-        self.verbose = verbose
-        self.log_file: Any | None = None
+@dataclass(frozen=True)
+class DesiredContainer:
+    image: str
+    workspace: str
+    gui: bool
+    publish_specs: tuple[str, ...]
 
-    def log(self, text: str) -> None:
-        if self.log_file is None:
-            return
-        self.log_file.write(text)
-        self.log_file.flush()
 
-    def run(
-        self,
-        cmd: list[str],
-        *,
-        capture: bool = False,
-        check: bool = True,
-        quiet: bool = False,
-        input_text: str | None = None,
-        stream: bool = False,
-    ) -> subprocess.CompletedProcess[str]:
-        if self.dry_run:
-            eprint("+ " + shjoin(cmd))
-            self.log(f"$ {shjoin(cmd)}\n")
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        self.log(f"\n[{time.strftime('%Y-%m-%dT%H:%M:%S%z')}] $ {shjoin(cmd)}\n")
-        if self.verbose and not quiet:
-            eprint("+ " + shjoin(cmd))
-        streamed = stream and input_text is None
-        try:
-            if streamed:
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                )
-                chunks: list[str] = []
-                assert process.stdout is not None
-                try:
-                    for line in process.stdout:
-                        chunks.append(line)
-                        sys.stdout.write(line)
-                        sys.stdout.flush()
-                        self.log(line)
-                finally:
-                    process.stdout.close()
-                result = subprocess.CompletedProcess(cmd, process.wait(), "".join(chunks), "")
-            else:
-                result = subprocess.run(
-                    cmd, text=True, capture_output=capture, input=input_text, check=False
-                )
-        except FileNotFoundError as exc:
-            raise OmpKaliError(
-                f"Required command not found: {cmd[0]}. Install podman, then retry."
-            ) from exc
-        if check and result.returncode != 0:
-            detail = ""
-            if capture and not streamed:
-                detail = ((result.stdout or "") + (result.stderr or "")).strip()
-            if detail:
-                raise OmpKaliError(f"Command failed: {shjoin(cmd)}\n{detail}")
-            raise OmpKaliError(f"Command failed ({result.returncode}): {shjoin(cmd)}")
-        return result
+def recreate_reason(facts: ContainerFacts, desired: DesiredContainer) -> str | None:
+    """The first reason the observed container must be recreated, or None."""
+    if not facts.exists:
+        return None
+    if facts.image and facts.image != desired.image:
+        return f"Container image changed ({facts.image} -> {desired.image})."
+    if facts.workspace != desired.workspace or facts.gui != desired.gui:
+        return (
+            f"Container workspace/GUI changed ({facts.workspace or '(none)'} -> "
+            f"{desired.workspace}, gui={desired.gui})."
+        )
+    if set(facts.publish_specs) != set(desired.publish_specs):
+        actual = ", ".join(sorted(facts.publish_specs)) or "(none)"
+        wanted = ", ".join(sorted(desired.publish_specs)) or "(none)"
+        return f"Published ports changed (actual: {actual} -> desired: {wanted})."
+    return None
 
 
 class Container:
-    def __init__(self, runner: Runner | None = None) -> None:
-        self.runner = runner or Runner()
+    def __init__(self, podman: Podman) -> None:
+        self.podman = podman
         self.user = pwd.getpwuid(os.getuid()).pw_name
         self.uid = os.getuid()
         self.gid = os.getgid()
@@ -185,19 +148,10 @@ class Container:
     # -- low level -----------------------------------------------------
 
     def _note(self, message: str) -> None:
-        eprint(message)
-        self.runner.log(message + "\n")
+        self.podman.note(message)
 
-    def _inspect(self, fmt: str) -> str:
-        if self.runner.dry_run:
-            return ""
-        result = self.runner.run(
-            [PODMAN, "inspect", "-f", fmt, CONTAINER],
-            capture=True,
-            check=False,
-            quiet=True,
-        )
-        return (result.stdout or "").strip()
+    def _facts(self) -> ContainerFacts:
+        return self.podman.observe()
 
     def podman_exec(
         self,
@@ -207,17 +161,14 @@ class Container:
         detach: bool = False,
         stream: bool = False,
     ) -> subprocess.CompletedProcess[str]:
-        cmd = [PODMAN, "exec"]
-        if detach:
-            cmd.append("-d")
-        cmd.extend([
-            "-u", f"{self.uid}:{self.gid}",
-            "-e", f"HOME={CONTAINER_HOME}",
-            "-e", f"USER={self.user}",
-            CONTAINER,
-            *args,
-        ])
-        return self.runner.run(cmd, capture=not stream, check=check, quiet=not detach, stream=stream)
+        return self.podman.exec(
+            args,
+            user=f"{self.uid}:{self.gid}",
+            env={"HOME": CONTAINER_HOME, "USER": self.user},
+            detach=detach,
+            stream=stream,
+            check=check,
+        )
 
     def root_exec(
         self,
@@ -227,15 +178,18 @@ class Container:
         env: dict[str, str] | None = None,
         stream: bool = False,
     ) -> subprocess.CompletedProcess[str]:
-        cmd = [PODMAN, "exec", "-u", "0"]
-        for key, value in (env or {}).items():
-            cmd.extend(["-e", f"{key}={value}"])
-        cmd.extend([CONTAINER, *args])
-        return self.runner.run(cmd, capture=not stream, check=check, quiet=True, stream=stream)
+        return self.podman.exec(
+            args,
+            user="0",
+            env=env,
+            detach=False,
+            stream=stream,
+            check=check,
+            quiet=True,
+        )
 
     def require_tools(self) -> None:
-        if shutil.which(PODMAN) is None:
-            raise OmpKaliError("podman is required. Install podman, then retry.")
+        self.podman.require_tools()
 
     def image_hash(self, repo: Path) -> str:
         dockerfile = repo / "Dockerfile"
@@ -252,12 +206,7 @@ class Container:
         return f"{IMAGE_REPO}:local-{self.image_hash(repo)[:16]}"
 
     def image_exists(self, tag: str) -> bool:
-        if self.runner.dry_run:
-            return False
-        result = self.runner.run(
-            [PODMAN, "image", "exists", tag], capture=True, check=False, quiet=True
-        )
-        return result.returncode == 0
+        return self.podman.image_exists(tag)
 
     def ensure_image(self, repo: Path) -> str:
         tag = self.image_tag(repo)
@@ -276,65 +225,50 @@ class Container:
             f"PROVISION_HASH={self.image_hash(repo)}",
             str(repo),
         ]
-        if self.runner.dry_run:
-            self.runner.run(build)
+        if self.podman.dry_run:
+            self.podman.run(build)
             return tag
         if self.image_exists(tag):
             return tag
         log_path = paths.STATE_DIR / paths.PROVISION_LOG
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        self.runner.log_file = log_path.open("a", encoding="utf-8")
-        os.chmod(log_path, 0o600)
+        self.podman.open_log(log_path)
         try:
-            self.runner.log(f"\n=== {time.strftime('%Y-%m-%dT%H:%M:%S%z')} building image {tag} ===\n")
+            self.podman.log(f"\n=== {time.strftime('%Y-%m-%dT%H:%M:%S%z')} building image {tag} ===\n")
             self._note(f"image: building {tag}")
-            self.runner.run(build, capture=False, stream=True)
+            self.podman.run(build, capture=False, stream=True)
         finally:
-            self.runner.log_file.close()
-            self.runner.log_file = None
+            self.podman.close_log()
         return tag
 
     def exists(self) -> bool:
-        if self.runner.dry_run:
-            return False
-        result = self.runner.run(
-            [PODMAN, "container", "exists", CONTAINER], capture=True, check=False, quiet=True
-        )
-        return result.returncode == 0
+        return self._facts().exists
 
     def running(self) -> bool:
-        if self.runner.dry_run:
-            return False
-        return self._inspect("{{.State.Running}}").lower() == "true"
+        return self._facts().running
 
     def managed(self) -> bool:
-        if self.runner.dry_run:
-            return True
-        return self._inspect('{{index .Config.Labels "' + MANAGED_LABEL + '"}}') == "true"
+        return self._facts().managed
 
     def label(self, name: str) -> str:
-        return self._inspect('{{index .Config.Labels "' + name + '"}}')
+        return self._facts().labels.get(name, "")
 
     def container_id(self) -> str:
-        return self._inspect("{{.Id}}")
+        return self._facts().container_id
 
     def image_name(self) -> str:
-        return self._inspect("{{.Config.Image}}")
+        return self._facts().image
 
     def workspace_source(self) -> str:
-        return self.label(WORKSPACE_LABEL)
+        return self._facts().workspace
 
     def ensure_volume(self) -> None:
-        if self.runner.dry_run:
+        if self.podman.dry_run:
             return
-        result = self.runner.run(
-            [PODMAN, "volume", "exists", VOLUME], capture=True, check=False, quiet=True
-        )
-        if result.returncode != 0:
-            self.runner.run([PODMAN, "volume", "create", VOLUME], capture=True)
+        if not self.podman.volume_exists(VOLUME):
+            self.podman.run([PODMAN, "volume", "create", VOLUME], capture=True)
 
     def check_kali(self) -> str:
-        if self.runner.dry_run:
+        if self.podman.dry_run:
             return "Kali (dry run)"
         result = self.root_exec(["cat", "/etc/os-release"], check=False)
         text = (result.stdout or "").strip()
@@ -346,34 +280,46 @@ class Container:
         return "Kali Linux"
 
     def actual_publish_specs(self) -> list[str]:
-        if self.runner.dry_run:
-            return []
-        result = self.runner.run(
-            [PODMAN, "inspect", "-f", "{{json .HostConfig.PortBindings}}", CONTAINER],
-            capture=True,
-            check=False,
-            quiet=True,
-        )
-        raw = (result.stdout or "").strip()
-        if not raw:
-            return []
-        try:
-            bindings = json.loads(raw)
-        except json.JSONDecodeError:
-            return []
-        specs: list[str] = []
-        for container_port, entries in (bindings or {}).items():
-            if not container_port.endswith("/tcp"):
-                continue
-            port = container_port.split("/", 1)[0]
-            for entry in entries or []:
-                host_ip = entry.get("HostIp") or "0.0.0.0"
-                host_port = entry.get("HostPort")
-                if host_port:
-                    specs.append(f"{host_ip}:{host_port}:{port}")
-        return sorted(specs)
+        return list(self._facts().publish_specs)
 
     # -- lifecycle -----------------------------------------------------
+
+    def _apply(
+        self,
+        state: dict[str, Any],
+        *,
+        desired: DesiredContainer,
+        repo: Path,
+        provision: bool = True,
+        facts: ContainerFacts | None = None,
+    ) -> ContainerFacts:
+        """Create, start, check, and provision the container as needed."""
+        if facts is None:
+            facts = self.podman.observe()
+        if not facts.exists:
+            eprint(f"Creating podman container {CONTAINER} from {desired.image}...")
+            self.podman.run(
+                create_command(
+                    Path(desired.workspace),
+                    desired.gui,
+                    list(desired.publish_specs),
+                    repo,
+                    desired.image,
+                ),
+                capture=False,
+            )
+            state["applied_publish"] = list(desired.publish_specs)
+            facts = self.podman.observe()
+        if not facts.running:
+            eprint(f"Starting container {CONTAINER}...")
+            self.podman.run([PODMAN, "start", CONTAINER], capture=True)
+            facts = self.podman.observe()
+        self.check_kali()
+        state["workspace"] = desired.workspace
+        state["gui"] = desired.gui
+        if provision:
+            self.provision()
+        return facts
 
     def ensure(
         self,
@@ -388,73 +334,39 @@ class Container:
         self.ensure_volume()
         repo = paths.ensure_repo_assets()[0]
         image = self.ensure_image(repo)
-        desired = desired_publish_specs(mappings_from_state(state))
         cwd = cwd.resolve()
+        desired = DesiredContainer(
+            image=image,
+            workspace=str(cwd),
+            gui=gui,
+            publish_specs=tuple(desired_publish_specs(mappings_from_state(state))),
+        )
+        facts = self.podman.observe()
 
-        if self.runner.dry_run:
-            self.runner.run(create_command(cwd, gui, desired, repo, image))
+        if self.podman.dry_run:
+            self.podman.run(create_command(cwd, gui, list(desired.publish_specs), repo, image))
             if provision:
                 self.provision()
             return
 
-        if not self.exists():
-            eprint(f"Creating podman container {CONTAINER} from {image}...")
-            self.runner.run(create_command(cwd, gui, desired, repo, image), capture=False)
-            state["applied_publish"] = desired
-        else:
-            if not self.managed():
+        if facts.exists:
+            if not facts.managed:
                 raise OmpKaliError(
                     f"A container named {CONTAINER} exists and was not created by omp-kali."
                 )
-            existing_ws = self.workspace_source()
-            existing_gui = self.label(GUI_LABEL) == "true"
-            existing_image = self.image_name()
-            if existing_image and existing_image != image:
+            reason = recreate_reason(facts, desired)
+            if reason:
                 self.request_recreate(
                     state,
                     cwd=cwd,
                     gui=gui,
                     image=image,
                     assume_yes=assume_yes,
-                    reason=f"Container image changed ({existing_image} -> {image}).",
-                )
-                return
-            if existing_ws != str(cwd) or existing_gui != gui:
-                self.request_recreate(
-                    state,
-                    cwd=cwd,
-                    gui=gui,
-                    image=image,
-                    assume_yes=assume_yes,
-                    reason=f"Container workspace/GUI changed ({existing_ws or '(none)'} -> {cwd}, gui={gui}).",
-                )
-                return
-            if not self.running():
-                eprint(f"Starting container {CONTAINER}...")
-                self.runner.run([PODMAN, "start", CONTAINER], capture=True)
-            actual = self.actual_publish_specs()
-            if set(actual) != set(desired):
-                self.request_recreate(
-                    state,
-                    cwd=cwd,
-                    gui=gui,
-                    image=image,
-                    assume_yes=assume_yes,
-                    reason=(
-                        "Published port set differs from the configured set:\n"
-                        f"  container: {', '.join(actual) or '(none)'}\n"
-                        f"  requested: {', '.join(desired) or '(none)'}"
-                    ),
+                    reason=reason,
                 )
                 return
 
-        if not self.running():
-            self.runner.run([PODMAN, "start", CONTAINER], capture=True)
-        self.check_kali()
-        state["workspace"] = str(cwd)
-        state["gui"] = gui
-        if provision:
-            self.provision()
+        self._apply(state, desired=desired, repo=repo, provision=provision, facts=facts)
 
     def request_recreate(
         self,
@@ -478,28 +390,26 @@ class Container:
     def recreate(self, state: dict[str, Any], *, cwd: Path, gui: bool, image: str | None = None) -> None:
         if self.exists():
             eprint(f"Removing container {CONTAINER}...")
-            self.runner.run([PODMAN, "rm", "-f", "-t", "0", CONTAINER], capture=True)
-        desired = desired_publish_specs(mappings_from_state(state))
+            self.podman.run([PODMAN, "rm", "-f", "-t", "0", CONTAINER], capture=True)
         repo = paths.ensure_repo_assets()[0]
         if image is None:
             image = self.ensure_image(repo)
         cwd = cwd.resolve()
+        desired = DesiredContainer(
+            image=image,
+            workspace=str(cwd),
+            gui=gui,
+            publish_specs=tuple(desired_publish_specs(mappings_from_state(state))),
+        )
         eprint(f"Recreating podman container {CONTAINER}...")
-        self.runner.run(create_command(cwd, gui, desired, repo, image), capture=False)
-        state["applied_publish"] = desired
-        state["workspace"] = str(cwd)
-        state["gui"] = gui
-        if not self.running():
-            self.runner.run([PODMAN, "start", CONTAINER], capture=True)
-        self.check_kali()
-        self.provision()
+        self._apply(state, desired=desired, repo=repo, provision=True)
         self.restart_relays(mappings_from_state(state))
 
     def remove(self, *, purge: bool = False) -> None:
         if self.exists():
-            self.runner.run([PODMAN, "rm", "-f", "-t", "0", CONTAINER], capture=True)
-        if purge and not self.runner.dry_run:
-            self.runner.run([PODMAN, "volume", "rm", "-f", VOLUME], capture=True, check=False)
+            self.podman.run([PODMAN, "rm", "-f", "-t", "0", CONTAINER], capture=True)
+        if purge and not self.podman.dry_run:
+            self.podman.run([PODMAN, "volume", "rm", "-f", VOLUME], capture=True, check=False)
             for path in (
                 paths.STATE_DIR / "provision-state.json",
                 paths.DATA_DIR / "relay.json",
@@ -509,21 +419,19 @@ class Container:
     # -- provisioning --------------------------------------------------
 
     def provision(self, *, force_binary: bool = False, force_hooks: bool = False, force_mcp: bool = False) -> str:
-        if self.runner.dry_run:
+        if self.podman.dry_run:
             eprint(f"[dry-run] would provision {CONTAINER}")
             return "(dry run)"
         if not self.exists():
             raise OmpKaliError(f"Container {CONTAINER} does not exist; run `omp-kali create` first.")
         if not self.running():
-            self.runner.run([PODMAN, "start", CONTAINER], capture=True)
+            self.podman.run([PODMAN, "start", CONTAINER], capture=True)
 
         log_path = paths.STATE_DIR / paths.PROVISION_LOG
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         header = f"\n=== {time.strftime('%Y-%m-%dT%H:%M:%S%z')} provisioning {CONTAINER} ({self.container_id()}) ===\n"
-        self.runner.log_file = log_path.open("a", encoding="utf-8")
-        os.chmod(log_path, 0o600)
+        self.podman.open_log(log_path)
         try:
-            self.runner.log(header)
+            self.podman.log(header)
             self._note(f"provisioning: log {log_path}")
             self._note(f"provisioning: binary={force_binary} hooks={force_hooks} mcp={force_mcp}")
             repo, _skills, _agents, _mcp_file = paths.ensure_repo_assets()
@@ -549,8 +457,7 @@ class Container:
             self._note(f"omp in container: {version}")
             return version
         finally:
-            self.runner.log_file.close()
-            self.runner.log_file = None
+            self.podman.close_log()
 
     def verify_asset_mounts(self) -> None:
         for path in (
@@ -569,7 +476,7 @@ class Container:
             f"mkdir -p {shlex.quote(CONTAINER_HOME + '/.omp/agent')} {shlex.quote(CONTAINER_HOME + '/.local/bin')} {shlex.quote(CONTAINER_HOME + '/.omp-kali')} && "
             f"chown {self.uid}:{self.gid} {shlex.quote(CONTAINER_HOME + '/.omp')} {shlex.quote(CONTAINER_HOME + '/.omp/agent')} {shlex.quote(CONTAINER_HOME + '/.local')} {shlex.quote(CONTAINER_HOME + '/.omp-kali')}"
         )
-        self.runner.run([PODMAN, "exec", "-u", "0", CONTAINER, "sh", "-c", script], capture=True, stream=True)
+        self.podman.run([PODMAN, "exec", "-u", "0", CONTAINER, "sh", "-c", script], capture=True, stream=True)
 
     def install_binary(self, *, force: bool = False) -> None:
         destination = f"{CONTAINER_HOME}/.local/bin/omp"
@@ -588,14 +495,14 @@ class Container:
             )
         self._note(f"provisioning: copying host omp binary ({host_omp})")
         temp = f"/tmp/omp-kali-omp-{os.getpid()}"
-        self.runner.run([PODMAN, "cp", host_omp, f"{CONTAINER}:{temp}"], capture=True, stream=True)
+        self.podman.run([PODMAN, "cp", host_omp, f"{CONTAINER}:{temp}"], capture=True, stream=True)
         script = (
             f"mkdir -p {shlex.quote(CONTAINER_HOME + '/.local/bin')} && "
             f"chown {self.uid}:{self.gid} {shlex.quote(CONTAINER_HOME + '/.local')} {shlex.quote(CONTAINER_HOME + '/.local/bin')} && "
             f"install -o {self.uid} -g {self.gid} -m 0755 {shlex.quote(temp)} {shlex.quote(destination)} && "
             f"rm -f {shlex.quote(temp)}"
         )
-        self.runner.run([PODMAN, "exec", "-u", "0", CONTAINER, "sh", "-c", script], capture=True, stream=True)
+        self.podman.run([PODMAN, "exec", "-u", "0", CONTAINER, "sh", "-c", script], capture=True, stream=True)
 
     def ensure_python(self) -> None:
         def has_python() -> bool:
@@ -604,7 +511,7 @@ class Container:
         if has_python():
             return
         self._note("provisioning: installing python3 for port relays")
-        self.runner.run(
+        self.podman.run(
             [
                 PODMAN,
                 "exec",
@@ -628,7 +535,7 @@ class Container:
         source = Path(__file__).with_name("relay.py")
         temp = f"/tmp/omp-kali-relay-{os.getpid()}.py"
         self._note("provisioning: installing port relay")
-        self.runner.run([PODMAN, "cp", str(source), f"{CONTAINER}:{temp}"], capture=True, stream=True)
+        self.podman.run([PODMAN, "cp", str(source), f"{CONTAINER}:{temp}"], capture=True, stream=True)
         destination = f"{CONTAINER_HOME}/.omp-kali/relay.py"
         script = (
             f"mkdir -p {shlex.quote(CONTAINER_HOME + '/.omp-kali')} && "
@@ -637,7 +544,7 @@ class Container:
             f"install -o {self.uid} -g {self.gid} -m 0755 {shlex.quote(temp)} {shlex.quote(destination)} && "
             f"rm -f {shlex.quote(temp)}"
         )
-        self.runner.run([PODMAN, "exec", "-u", "0", CONTAINER, "sh", "-c", script], capture=True, stream=True)
+        self.podman.run([PODMAN, "exec", "-u", "0", CONTAINER, "sh", "-c", script], capture=True, stream=True)
 
     def ensure_path(self) -> None:
         start = "# >>> omp-kali path >>>"
@@ -665,7 +572,7 @@ done
         scripts = provisioning.load_scripts(repo)
         if not scripts:
             return
-        if self.runner.dry_run:
+        if self.podman.dry_run:
             for script in scripts:
                 if force or state["scripts"].get(script.name) != script.sha256:
                     eprint(f"[dry-run] would run provisioning script {script.name}")
@@ -675,7 +582,7 @@ done
                 continue
             self._note(f"provisioning: running {script.name}")
             temp = f"/tmp/omp-kali-provision-{os.getpid()}-{index}.sh"
-            self.runner.run([PODMAN, "cp", str(script.path), f"{CONTAINER}:{temp}"], capture=True, stream=True)
+            self.podman.run([PODMAN, "cp", str(script.path), f"{CONTAINER}:{temp}"], capture=True, stream=True)
             try:
                 result = self.root_exec(["bash", temp], check=False, env=self._provision_env(), stream=True)
                 if result.returncode != 0:
@@ -689,7 +596,7 @@ done
         manifests = load_manifests(repo / paths.MCP_DIR / paths.MCP_SERVERS_DIR)
         if not manifests:
             return
-        if self.runner.dry_run:
+        if self.podman.dry_run:
             for manifest in manifests:
                 if manifest.enabled:
                     eprint(f"[dry-run] would configure MCP server {manifest.name}")
@@ -802,8 +709,8 @@ done
         host_config = paths.DATA_DIR / "relay.json"
         host_config.parent.mkdir(parents=True, exist_ok=True)
         host_config.write_text(json.dumps(desired, indent=2) + "\n", encoding="utf-8")
-        self.runner.run([PODMAN, "cp", str(host_config), f"{CONTAINER}:{config_path}"], capture=True)
-        self.runner.run(
+        self.podman.run([PODMAN, "cp", str(host_config), f"{CONTAINER}:{config_path}"], capture=True)
+        self.podman.run(
             [PODMAN, "exec", "-u", "0", CONTAINER, "chown", f"{self.uid}:{self.gid}", config_path],
             capture=True,
             check=False,
@@ -871,42 +778,36 @@ done
             if os.environ.get("XAUTHORITY"):
                 env["XAUTHORITY"] = "/run/omp-kali/Xauthority"
         env.update(pass_env)
-        cmd = [PODMAN, "exec", "-i"]
-        if sys.stdin.isatty():
-            cmd.append("-t")
-        cmd.extend(["-u", f"{self.uid}:{self.gid}"])
-        for key, value in env.items():
-            cmd.extend(["-e", f"{key}={value}"])
-        cmd.extend(["-w", str(workdir), CONTAINER, "bash", "-c", inner])
-        if self.runner.dry_run:
-            eprint("+ " + shjoin(cmd))
-            return 0
-        result = self.runner.run(cmd, capture=False, check=False)
+        result = self.podman.exec(
+            ["bash", "-c", inner],
+            user=f"{self.uid}:{self.gid}",
+            env=env,
+            interactive=True,
+            tty=sys.stdin.isatty(),
+            workdir=str(workdir),
+            capture=False,
+            check=False,
+            quiet=False,
+        )
         return result.returncode
 
     # -- status --------------------------------------------------------
 
     def status(self) -> dict[str, Any]:
+        facts = self.podman.observe()
         info: dict[str, Any] = {
-            "exists": self.exists(),
-            "running": False,
-            "managed": False,
-            "image": "",
+            "exists": facts.exists,
+            "running": facts.running,
+            "managed": facts.managed,
+            "image": facts.image,
             "kali": "",
             "home": CONTAINER_HOME,
             "volume": VOLUME,
-            "workspace": "",
-            "gui": False,
+            "workspace": facts.workspace,
+            "gui": facts.gui,
             "omp_version": "",
         }
-        if not info["exists"]:
-            return info
-        info["running"] = self.running()
-        info["managed"] = self.managed()
-        info["image"] = self.image_name()
-        info["workspace"] = self.workspace_source()
-        info["gui"] = self.label(GUI_LABEL) == "true"
-        if not info["running"]:
+        if not facts.exists or not facts.running:
             return info
         info["kali"] = self.check_kali()
         version = self.podman_exec([f"{CONTAINER_HOME}/.local/bin/omp", "--version"], check=False)
