@@ -31,3 +31,11 @@ _Avoid_: data volume, state volume
 **Workspace**:
 The single host directory mounted into the Container at `/workspace/<name>`.
 _Avoid_: project, mount, volume
+
+**Container layout**:
+The fixed facts of the Container that never vary per run: its name, home volume, home directory (`/home/omp`), workspace root (`/workspace`), and base image.
+_Avoid_: constants, config, settings
+
+**State**:
+The persisted configuration and provision record for the Container: workspace, GUI flag, published ports, container id, provisioned script hashes, and MCP settings. It survives recreation.
+_Avoid_: config, data, store

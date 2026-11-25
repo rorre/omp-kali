@@ -1,7 +1,7 @@
 import unittest
 
-from omp_kali.errors import OmpKaliError
-from omp_kali.ports import (
+from omp_kali.core.errors import OmpKaliError
+from omp_kali.domain.ports import (
     DEFAULT_BIND,
     PortMapping,
     desired_publish_specs,

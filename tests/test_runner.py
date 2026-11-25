@@ -4,7 +4,7 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from omp_kali.podman import Runner
+from omp_kali.infra.podman import Runner
 
 
 class RunnerStreamTests(unittest.TestCase):

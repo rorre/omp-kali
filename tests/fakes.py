@@ -11,7 +11,8 @@ import dataclasses
 import subprocess
 from pathlib import Path
 
-from omp_kali.podman import CONTAINER, PODMAN, ContainerFacts
+from omp_kali.core.constants import CONTAINER, PODMAN
+from omp_kali.domain.facts import ContainerFacts
 
 
 class FakeRunner:

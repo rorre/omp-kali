@@ -6,44 +6,13 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from .errors import OmpKaliError
-from .util import eprint, shjoin
-
-PODMAN = "podman"
-CONTAINER = "omp-kali"
-VOLUME = "omp-kali-home"
-MANAGED_LABEL = "omp-kali.managed"
-WORKSPACE_LABEL = "omp-kali.workspace"
-GUI_LABEL = "omp-kali.gui"
-
-
-@dataclass(frozen=True)
-class ContainerFacts:
-    """What the managed container currently looks like, as observed from podman."""
-
-    exists: bool = False
-    running: bool = False
-    image: str = ""
-    labels: Mapping[str, str] = field(default_factory=dict)
-    publish_specs: tuple[str, ...] = ()
-    container_id: str = ""
-
-    @property
-    def managed(self) -> bool:
-        return self.labels.get(MANAGED_LABEL) == "true"
-
-    @property
-    def workspace(self) -> str:
-        return self.labels.get(WORKSPACE_LABEL, "")
-
-    @property
-    def gui(self) -> bool:
-        return self.labels.get(GUI_LABEL) == "true"
+from ..core.constants import CONTAINER, MANAGED_LABEL, PODMAN
+from ..core.errors import OmpKaliError
+from ..core.util import eprint, shjoin
+from ..domain.facts import ContainerFacts
 
 
 class Podman(Protocol):

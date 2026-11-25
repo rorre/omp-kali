@@ -5,8 +5,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from .errors import OmpKaliError
-from .util import parse_port
+from ..core.errors import OmpKaliError
+from ..core.util import parse_port
 
 DIRECTIONS = ("host-to-container", "container-to-host")
 ABBR = {"host-to-container": "h2c", "container-to-host": "c2h"}

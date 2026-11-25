@@ -36,7 +36,7 @@ class RelayTests(unittest.TestCase):
         target_thread = threading.Thread(target=target.serve_forever, daemon=True)
         target_thread.start()
         listen_port = _free_port()
-        relay_script = Path(__file__).resolve().parents[1] / "src" / "omp_kali" / "relay.py"
+        relay_script = Path(__file__).resolve().parents[1] / "src" / "omp_kali" / "infra" / "relay.py"
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

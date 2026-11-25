@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import inspect
 import os
 import subprocess
 import sys
@@ -10,12 +12,16 @@ from typing import Any, List, Optional
 
 import typer
 
-from . import __version__, paths
-from .container import CONTAINER, Container, container_workdir
-from .errors import OmpKaliError
-from .podman import RealPodman, Runner
-from .mcp import load_manifests
-from .ports import (
+from . import __version__
+from .core import paths
+from .app.container import Container
+from .core.constants import CONTAINER
+from .domain.desired import container_workdir
+from .core.errors import OmpKaliError
+from .infra.podman import RealPodman, Runner
+from .domain.state import FileStatePersistence, State, StateStore
+from .infra.mcp import load_manifests
+from .domain.ports import (
     DEFAULT_BIND,
     RELAY_TARGET,
     PortMapping,
@@ -24,20 +30,21 @@ from .ports import (
     mappings_from_state,
     mappings_to_state,
 )
-from .util import confirm, eprint, parse_port
+from .core.util import confirm, eprint, parse_port
 
 app = typer.Typer(
     add_completion=False,
     help="Run an isolated omp instance inside a Kali Linux podman container.",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
 )
 ports_app = typer.Typer(add_completion=False, help="Manage permissioned port forwards.")
 app.add_typer(ports_app, name="ports")
 mcp_app = typer.Typer(add_completion=False, help="Inspect and install repository MCP server manifests.")
 app.add_typer(mcp_app, name="mcp")
 
-COMMANDS = {"run", "shell", "create", "rm", "status", "sync", "update", "ports", "mcp", "provision"}
+COMMANDS = {"run", "shell", "create", "rm", "status", "ports", "mcp", "provision"}
 GLOBAL_FLAGS = {"--gui", "--yes", "-y", "--dry-run", "--verbose", "-v"}
-GLOBAL_VALUE_OPTIONS = {"--dir", "-d", "--pass-env"}
+GLOBAL_VALUE_OPTIONS = {"--dir", "--pass-env"}
 
 
 class Direction(str, Enum):
@@ -55,24 +62,111 @@ class CommonOptions:
     verbose: bool = False
 
 
-def _merge_common(
-    ctx: typer.Context,
-    *,
-    directory: Optional[str],
-    gui: Optional[bool],
-    pass_env: Optional[List[str]],
-    yes: Optional[bool],
-    dry_run: Optional[bool],
-    verbose: Optional[bool],
-) -> CommonOptions:
+@dataclass
+class TyperCommonOptions:
+    """The single declaration of the six options every command shares."""
+
+    directory: Optional[str] = typer.Option(
+        None, "--dir", "-d", help="Directory to run in (default: cwd)."
+    )
+    gui: Optional[bool] = typer.Option(None, "--gui", help="Forward X11/Wayland from the host.")
+    pass_env: Optional[List[str]] = typer.Option(
+        None, "--pass-env", metavar="NAME", help="Pass one host environment variable (repeatable)."
+    )
+    yes: Optional[bool] = typer.Option(
+        None, "--yes", "-y", help="Approve permission prompts without asking."
+    )
+    dry_run: Optional[bool] = typer.Option(
+        None, "--dry-run", help="Print commands without executing them."
+    )
+    verbose: Optional[bool] = typer.Option(None, "--verbose", "-v", help="Print every command.")
+
+
+def with_common_options(func):
+    """Inject the six common options into a Typer command's signature."""
+    sig = inspect.signature(func)
+    params = list(sig.parameters.values())
+
+    common_params = [
+        inspect.Parameter(
+            "directory",
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            default=typer.Option(None, "--dir", "-d", help="Directory to run in (default: cwd)."),
+            annotation=Optional[str],
+        ),
+        inspect.Parameter(
+            "gui",
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            default=typer.Option(None, "--gui", help="Forward X11/Wayland from the host."),
+            annotation=Optional[bool],
+        ),
+        inspect.Parameter(
+            "pass_env",
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            default=typer.Option(
+                None, "--pass-env", metavar="NAME", help="Pass one host environment variable (repeatable)."
+            ),
+            annotation=Optional[List[str]],
+        ),
+        inspect.Parameter(
+            "yes",
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            default=typer.Option(None, "--yes", "-y", help="Approve permission prompts without asking."),
+            annotation=Optional[bool],
+        ),
+        inspect.Parameter(
+            "dry_run",
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            default=typer.Option(None, "--dry-run", help="Print commands without executing them."),
+            annotation=Optional[bool],
+        ),
+        inspect.Parameter(
+            "verbose",
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            default=typer.Option(None, "--verbose", "-v", help="Print every command."),
+            annotation=Optional[bool],
+        ),
+    ]
+
+    new_params = []
+    for p in params:
+        if p.name == "ctx":
+            new_params.append(p)
+            new_params.extend(common_params)
+        elif p.name == "common":
+            continue
+        else:
+            new_params.append(p)
+
+    new_sig = sig.replace(parameters=new_params)
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        common = kwargs.pop("common", None)
+        if common is None:
+            common = TyperCommonOptions(
+                directory=kwargs.pop("directory", None),
+                gui=kwargs.pop("gui", None),
+                pass_env=kwargs.pop("pass_env", None),
+                yes=kwargs.pop("yes", None),
+                dry_run=kwargs.pop("dry_run", None),
+                verbose=kwargs.pop("verbose", None),
+            )
+        return func(*args, common=common, **kwargs)
+
+    wrapper.__signature__ = new_sig
+    return wrapper
+
+
+def _merge_common(ctx: typer.Context, common: TyperCommonOptions) -> CommonOptions:
     base = ctx.obj if isinstance(ctx.obj, CommonOptions) else CommonOptions()
     return CommonOptions(
-        directory=directory if directory is not None else base.directory,
-        gui=bool(gui) if gui is not None else base.gui,
-        pass_env=list(dict.fromkeys([*base.pass_env, *(pass_env or [])])),
-        yes=bool(yes) if yes is not None else base.yes,
-        dry_run=bool(dry_run) if dry_run is not None else base.dry_run,
-        verbose=bool(verbose) if verbose is not None else base.verbose,
+        directory=common.directory if common.directory is not None else base.directory,
+        gui=bool(common.gui) if common.gui is not None else base.gui,
+        pass_env=list(dict.fromkeys([*base.pass_env, *(common.pass_env or [])])),
+        yes=bool(common.yes) if common.yes is not None else base.yes,
+        dry_run=bool(common.dry_run) if common.dry_run is not None else base.dry_run,
+        verbose=bool(common.verbose) if common.verbose is not None else base.verbose,
     )
 
 
@@ -83,7 +177,10 @@ def _port_arg(value: int) -> int:
         raise typer.BadParameter(str(exc)) from exc
 
 
-@app.callback()
+@app.callback(
+    invoke_without_command=True,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
 def configure(
     ctx: typer.Context,
     directory: Optional[str] = typer.Option(None, "--dir", "-d", help="Directory to run in (default: cwd)."),
@@ -107,23 +204,26 @@ def configure(
         dry_run=dry_run,
         verbose=verbose,
     )
+    if ctx.invoked_subcommand is None:
+        common = TyperCommonOptions(
+            directory=directory,
+            gui=gui,
+            pass_env=pass_env,
+            yes=yes,
+            dry_run=dry_run,
+            verbose=verbose,
+        )
+        ctx.invoke(run_command, ctx=ctx, common=common)
+        raise typer.Exit()
 
 
 @app.command("run", help="Start omp in the container (default).", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+@with_common_options
 def run_command(
     ctx: typer.Context,
-    directory: Optional[str] = typer.Option(None, "--dir", "-d", help="Directory to run in (default: cwd)."),
-    gui: Optional[bool] = typer.Option(None, "--gui", help="Forward X11/Wayland from the host."),
-    pass_env: Optional[List[str]] = typer.Option(
-        None, "--pass-env", metavar="NAME", help="Pass one host environment variable (repeatable)."
-    ),
-    yes: Optional[bool] = typer.Option(None, "--yes", "-y", help="Approve permission prompts without asking."),
-    dry_run: Optional[bool] = typer.Option(None, "--dry-run", help="Print commands without executing them."),
-    verbose: Optional[bool] = typer.Option(None, "--verbose", "-v", help="Print every command."),
+    common: TyperCommonOptions = TyperCommonOptions(),
 ) -> None:
-    opts = _merge_common(
-        ctx, directory=directory, gui=gui, pass_env=pass_env, yes=yes, dry_run=dry_run, verbose=verbose
-    )
+    opts = _merge_common(ctx, common)
     omp_args = list(ctx.args)
     if omp_args and omp_args[0] == "--":
         omp_args = omp_args[1:]
@@ -131,135 +231,80 @@ def run_command(
 
 
 @app.command("shell", help="Drop into a shell in the container.")
+@with_common_options
 def shell_command(
     ctx: typer.Context,
     command: Optional[str] = typer.Option(None, "-c", "--command", help="Run one shell command instead of an interactive shell."),
-    directory: Optional[str] = typer.Option(None, "--dir", "-d", help="Directory to run in (default: cwd)."),
-    gui: Optional[bool] = typer.Option(None, "--gui", help="Forward X11/Wayland from the host."),
-    pass_env: Optional[List[str]] = typer.Option(
-        None, "--pass-env", metavar="NAME", help="Pass one host environment variable (repeatable)."
-    ),
-    yes: Optional[bool] = typer.Option(None, "--yes", "-y", help="Approve permission prompts without asking."),
-    dry_run: Optional[bool] = typer.Option(None, "--dry-run", help="Print commands without executing them."),
-    verbose: Optional[bool] = typer.Option(None, "--verbose", "-v", help="Print every command."),
+    common: TyperCommonOptions = TyperCommonOptions(),
 ) -> None:
-    opts = _merge_common(
-        ctx, directory=directory, gui=gui, pass_env=pass_env, yes=yes, dry_run=dry_run, verbose=verbose
-    )
+    opts = _merge_common(ctx, common)
     raise typer.Exit(_ensure_and_run(opts, omp_args=[], shell=True, shell_command=command))
 
 
 @app.command("create", help="Create/provision the container.")
+@with_common_options
 def create_command(
     ctx: typer.Context,
     recreate: bool = typer.Option(False, "--recreate", help="Remove and recreate the container."),
-    directory: Optional[str] = typer.Option(None, "--dir", "-d", help="Directory to run in (default: cwd)."),
-    gui: Optional[bool] = typer.Option(None, "--gui", help="Forward X11/Wayland from the host."),
-    pass_env: Optional[List[str]] = typer.Option(
-        None, "--pass-env", metavar="NAME", help="Pass one host environment variable (repeatable)."
-    ),
-    yes: Optional[bool] = typer.Option(None, "--yes", "-y", help="Approve permission prompts without asking."),
-    dry_run: Optional[bool] = typer.Option(None, "--dry-run", help="Print commands without executing them."),
-    verbose: Optional[bool] = typer.Option(None, "--verbose", "-v", help="Print every command."),
+    common: TyperCommonOptions = TyperCommonOptions(),
 ) -> None:
-    opts = _merge_common(
-        ctx, directory=directory, gui=gui, pass_env=pass_env, yes=yes, dry_run=dry_run, verbose=verbose
-    )
+    opts = _merge_common(ctx, common)
     raise typer.Exit(_cmd_create(opts, recreate=recreate))
 
 
 @app.command("rm", help="Remove the container.")
+@with_common_options
 def rm_command(
     ctx: typer.Context,
     purge: bool = typer.Option(False, "--purge", help="Also delete the container home (sessions/auth)."),
-    directory: Optional[str] = typer.Option(None, "--dir", "-d", help="Directory to run in (default: cwd)."),
-    gui: Optional[bool] = typer.Option(None, "--gui", help="Forward X11/Wayland from the host."),
-    pass_env: Optional[List[str]] = typer.Option(
-        None, "--pass-env", metavar="NAME", help="Pass one host environment variable (repeatable)."
-    ),
-    yes: Optional[bool] = typer.Option(None, "--yes", "-y", help="Approve permission prompts without asking."),
-    dry_run: Optional[bool] = typer.Option(None, "--dry-run", help="Print commands without executing them."),
-    verbose: Optional[bool] = typer.Option(None, "--verbose", "-v", help="Print every command."),
+    common: TyperCommonOptions = TyperCommonOptions(),
 ) -> None:
-    opts = _merge_common(
-        ctx, directory=directory, gui=gui, pass_env=pass_env, yes=yes, dry_run=dry_run, verbose=verbose
-    )
+    opts = _merge_common(ctx, common)
     raise typer.Exit(_cmd_rm(opts, purge=purge))
 
 
 @app.command("status", help="Show container and asset status.")
+@with_common_options
 def status_command(
     ctx: typer.Context,
-    directory: Optional[str] = typer.Option(None, "--dir", "-d", help="Directory to run in (default: cwd)."),
-    gui: Optional[bool] = typer.Option(None, "--gui", help="Forward X11/Wayland from the host."),
-    pass_env: Optional[List[str]] = typer.Option(
-        None, "--pass-env", metavar="NAME", help="Pass one host environment variable (repeatable)."
-    ),
-    yes: Optional[bool] = typer.Option(None, "--yes", "-y", help="Approve permission prompts without asking."),
-    dry_run: Optional[bool] = typer.Option(None, "--dry-run", help="Print commands without executing them."),
-    verbose: Optional[bool] = typer.Option(None, "--verbose", "-v", help="Print every command."),
+    common: TyperCommonOptions = TyperCommonOptions(),
 ) -> None:
-    opts = _merge_common(
-        ctx, directory=directory, gui=gui, pass_env=pass_env, yes=yes, dry_run=dry_run, verbose=verbose
-    )
+    opts = _merge_common(ctx, common)
     raise typer.Exit(_cmd_status(opts))
 
 
 @app.command("sync", help="Re-link skills/agents/MCP into the container.")
+@with_common_options
 def sync_command(
     ctx: typer.Context,
-    directory: Optional[str] = typer.Option(None, "--dir", "-d", help="Directory to run in (default: cwd)."),
-    gui: Optional[bool] = typer.Option(None, "--gui", help="Forward X11/Wayland from the host."),
-    pass_env: Optional[List[str]] = typer.Option(
-        None, "--pass-env", metavar="NAME", help="Pass one host environment variable (repeatable)."
-    ),
-    yes: Optional[bool] = typer.Option(None, "--yes", "-y", help="Approve permission prompts without asking."),
-    dry_run: Optional[bool] = typer.Option(None, "--dry-run", help="Print commands without executing them."),
-    verbose: Optional[bool] = typer.Option(None, "--verbose", "-v", help="Print every command."),
+    common: TyperCommonOptions = TyperCommonOptions(),
 ) -> None:
-    opts = _merge_common(
-        ctx, directory=directory, gui=gui, pass_env=pass_env, yes=yes, dry_run=dry_run, verbose=verbose
-    )
+    opts = _merge_common(ctx, common)
     raise typer.Exit(_cmd_sync(opts))
 
 
 @app.command("update", help="Copy the host omp binary into the container.")
+@with_common_options
 def update_command(
     ctx: typer.Context,
-    directory: Optional[str] = typer.Option(None, "--dir", "-d", help="Directory to run in (default: cwd)."),
-    gui: Optional[bool] = typer.Option(None, "--gui", help="Forward X11/Wayland from the host."),
-    pass_env: Optional[List[str]] = typer.Option(
-        None, "--pass-env", metavar="NAME", help="Pass one host environment variable (repeatable)."
-    ),
-    yes: Optional[bool] = typer.Option(None, "--yes", "-y", help="Approve permission prompts without asking."),
-    dry_run: Optional[bool] = typer.Option(None, "--dry-run", help="Print commands without executing them."),
-    verbose: Optional[bool] = typer.Option(None, "--verbose", "-v", help="Print every command."),
+    common: TyperCommonOptions = TyperCommonOptions(),
 ) -> None:
-    opts = _merge_common(
-        ctx, directory=directory, gui=gui, pass_env=pass_env, yes=yes, dry_run=dry_run, verbose=verbose
-    )
+    opts = _merge_common(ctx, common)
     raise typer.Exit(_cmd_update(opts))
 
 
 @ports_app.command("list", help="List configured port forwards.")
+@with_common_options
 def ports_list(
     ctx: typer.Context,
-    directory: Optional[str] = typer.Option(None, "--dir", "-d", help="Directory to run in (default: cwd)."),
-    gui: Optional[bool] = typer.Option(None, "--gui", help="Forward X11/Wayland from the host."),
-    pass_env: Optional[List[str]] = typer.Option(
-        None, "--pass-env", metavar="NAME", help="Pass one host environment variable (repeatable)."
-    ),
-    yes: Optional[bool] = typer.Option(None, "--yes", "-y", help="Approve permission prompts without asking."),
-    dry_run: Optional[bool] = typer.Option(None, "--dry-run", help="Print commands without executing them."),
-    verbose: Optional[bool] = typer.Option(None, "--verbose", "-v", help="Print every command."),
+    common: TyperCommonOptions = TyperCommonOptions(),
 ) -> None:
-    opts = _merge_common(
-        ctx, directory=directory, gui=gui, pass_env=pass_env, yes=yes, dry_run=dry_run, verbose=verbose
-    )
+    opts = _merge_common(ctx, common)
     raise typer.Exit(_cmd_ports_list(opts))
 
 
 @ports_app.command("add", help="Add a port forward (asks for permission).")
+@with_common_options
 def ports_add(
     ctx: typer.Context,
     direction: Direction = typer.Argument(..., help="host-to-container or container-to-host."),
@@ -269,18 +314,9 @@ def ports_add(
     target_host: str = typer.Option(
         RELAY_TARGET, "--target-host", help=f"host-to-container relay target (default: {RELAY_TARGET})."
     ),
-    directory: Optional[str] = typer.Option(None, "--dir", "-d", help="Directory to run in (default: cwd)."),
-    gui: Optional[bool] = typer.Option(None, "--gui", help="Forward X11/Wayland from the host."),
-    pass_env: Optional[List[str]] = typer.Option(
-        None, "--pass-env", metavar="NAME", help="Pass one host environment variable (repeatable)."
-    ),
-    yes: Optional[bool] = typer.Option(None, "--yes", "-y", help="Approve permission prompts without asking."),
-    dry_run: Optional[bool] = typer.Option(None, "--dry-run", help="Print commands without executing them."),
-    verbose: Optional[bool] = typer.Option(None, "--verbose", "-v", help="Print every command."),
+    common: TyperCommonOptions = TyperCommonOptions(),
 ) -> None:
-    opts = _merge_common(
-        ctx, directory=directory, gui=gui, pass_env=pass_env, yes=yes, dry_run=dry_run, verbose=verbose
-    )
+    opts = _merge_common(ctx, common)
     raise typer.Exit(
         _cmd_ports_add(
             opts,
@@ -294,77 +330,45 @@ def ports_add(
 
 
 @ports_app.command("remove", help="Remove a port forward by id.")
+@with_common_options
 def ports_remove(
     ctx: typer.Context,
     mapping_id: str = typer.Argument(..., metavar="ID"),
-    directory: Optional[str] = typer.Option(None, "--dir", "-d", help="Directory to run in (default: cwd)."),
-    gui: Optional[bool] = typer.Option(None, "--gui", help="Forward X11/Wayland from the host."),
-    pass_env: Optional[List[str]] = typer.Option(
-        None, "--pass-env", metavar="NAME", help="Pass one host environment variable (repeatable)."
-    ),
-    yes: Optional[bool] = typer.Option(None, "--yes", "-y", help="Approve permission prompts without asking."),
-    dry_run: Optional[bool] = typer.Option(None, "--dry-run", help="Print commands without executing them."),
-    verbose: Optional[bool] = typer.Option(None, "--verbose", "-v", help="Print every command."),
+    common: TyperCommonOptions = TyperCommonOptions(),
 ) -> None:
-    opts = _merge_common(
-        ctx, directory=directory, gui=gui, pass_env=pass_env, yes=yes, dry_run=dry_run, verbose=verbose
-    )
+    opts = _merge_common(ctx, common)
     raise typer.Exit(_cmd_ports_remove(opts, mapping_id))
 
 
 @app.command("provision", help="Run changed provisioning scripts and MCP installs.")
+@with_common_options
 def provision_command(
     ctx: typer.Context,
     force: bool = typer.Option(False, "--force", help="Re-run all scripts and MCP installs."),
-    directory: Optional[str] = typer.Option(None, "--dir", "-d", help="Directory to run in (default: cwd)."),
-    gui: Optional[bool] = typer.Option(None, "--gui", help="Forward X11/Wayland from the host."),
-    pass_env: Optional[List[str]] = typer.Option(
-        None, "--pass-env", metavar="NAME", help="Pass one host environment variable (repeatable)."
-    ),
-    yes: Optional[bool] = typer.Option(None, "--yes", "-y", help="Approve permission prompts without asking."),
-    dry_run: Optional[bool] = typer.Option(None, "--dry-run", help="Print commands without executing them."),
-    verbose: Optional[bool] = typer.Option(None, "--verbose", "-v", help="Print every command."),
+    common: TyperCommonOptions = TyperCommonOptions(),
 ) -> None:
-    opts = _merge_common(
-        ctx, directory=directory, gui=gui, pass_env=pass_env, yes=yes, dry_run=dry_run, verbose=verbose
-    )
+    opts = _merge_common(ctx, common)
     raise typer.Exit(_cmd_provision(opts, force=force))
 
 
 @mcp_app.command("list", help="List MCP server manifests.")
+@with_common_options
 def mcp_list_command(
     ctx: typer.Context,
-    directory: Optional[str] = typer.Option(None, "--dir", "-d", help="Directory to run in (default: cwd)."),
-    gui: Optional[bool] = typer.Option(None, "--gui", help="Forward X11/Wayland from the host."),
-    pass_env: Optional[List[str]] = typer.Option(
-        None, "--pass-env", metavar="NAME", help="Pass one host environment variable (repeatable)."
-    ),
-    yes: Optional[bool] = typer.Option(None, "--yes", "-y", help="Approve permission prompts without asking."),
-    dry_run: Optional[bool] = typer.Option(None, "--dry-run", help="Print commands without executing them."),
-    verbose: Optional[bool] = typer.Option(None, "--verbose", "-v", help="Print every command."),
+    common: TyperCommonOptions = TyperCommonOptions(),
 ) -> None:
-    opts = _merge_common(
-        ctx, directory=directory, gui=gui, pass_env=pass_env, yes=yes, dry_run=dry_run, verbose=verbose
-    )
+    opts = _merge_common(ctx, common)
     raise typer.Exit(_cmd_mcp_list(opts))
 
 
 @mcp_app.command("sync", help="Install and configure manifest MCP servers.")
+@with_common_options
 def mcp_sync_command(
     ctx: typer.Context,
     force: bool = typer.Option(False, "--force", help="Re-run MCP install steps."),
-    directory: Optional[str] = typer.Option(None, "--dir", "-d", help="Directory to run in (default: cwd)."),
-    gui: Optional[bool] = typer.Option(None, "--gui", help="Forward X11/Wayland from the host."),
-    pass_env: Optional[List[str]] = typer.Option(
-        None, "--pass-env", metavar="NAME", help="Pass one host environment variable (repeatable)."
-    ),
-    yes: Optional[bool] = typer.Option(None, "--yes", "-y", help="Approve permission prompts without asking."),
-    dry_run: Optional[bool] = typer.Option(None, "--dry-run", help="Print commands without executing them."),
-    verbose: Optional[bool] = typer.Option(None, "--verbose", "-v", help="Print every command."),
+    common: TyperCommonOptions = TyperCommonOptions(),
 ) -> None:
-    opts = _merge_common(
-        ctx, directory=directory, gui=gui, pass_env=pass_env, yes=yes, dry_run=dry_run, verbose=verbose
-    )
+    opts = _merge_common(ctx, common)
     raise typer.Exit(_cmd_mcp_sync(opts, force=force))
 
 
@@ -376,17 +380,15 @@ def _resolve_dir(value: Optional[str]) -> Path:
     return path
 
 
-def _state_cwd(state: dict[str, Any], opts: CommonOptions | None = None) -> Path:
-    value = state.get("workspace")
+def _state_cwd(state: State, opts: CommonOptions | None = None) -> Path:
+    value = state.workspace
     if value:
         return Path(value).expanduser().resolve()
     return _resolve_dir(opts.directory if opts else None)
 
 
-def _state_gui(state: dict[str, Any], opts: CommonOptions | None = None) -> bool:
-    if "gui" in state:
-        return bool(state["gui"])
-    return bool(opts.gui) if opts else False
+def _state_gui(state: State, opts: CommonOptions | None = None) -> bool:
+    return bool(state.gui)
 
 
 def _pass_env(names: List[str]) -> dict[str, str]:
@@ -435,9 +437,36 @@ def _warn_loopback(mapping: PortMapping) -> None:
         )
 
 
-def _load_container(opts: CommonOptions) -> tuple[Container, dict[str, Any]]:
+def _load_container(opts: CommonOptions) -> tuple[Container, State]:
     runner = Runner(dry_run=opts.dry_run, verbose=opts.verbose)
-    return Container(RealPodman(runner)), paths.load_state()
+    store = StateStore(FileStatePersistence(paths.STATE_DIR))
+    return Container(RealPodman(runner), store), store.load()
+
+
+def _ensure_and_save(
+    opts: CommonOptions, *, from_state: bool, provision: bool
+) -> tuple[Container, State]:
+    """Load state, bring the container up, and persist the resulting state.
+
+    ``from_state`` chooses the persisted workspace/GUI over the CLI options;
+    ``provision`` is passed through to the container's ensure step.
+    """
+    container, state = _load_container(opts)
+    if from_state:
+        cwd = _state_cwd(state, opts)
+        gui = _state_gui(state, opts)
+    else:
+        cwd = _resolve_dir(opts.directory)
+        gui = opts.gui
+    container.ensure(state, assume_yes=opts.yes, cwd=cwd, gui=gui, provision=provision)
+    if not opts.dry_run:
+        container.store.save(state)
+    return container, state
+
+
+def _sync_relays(container: Container, state: State) -> None:
+    """Publish the state's port mappings to the relay."""
+    container.restart_relays(mappings_from_state({"ports": state.ports}))
 
 
 def _ensure_and_run(
@@ -447,12 +476,9 @@ def _ensure_and_run(
     shell: bool,
     shell_command: Optional[str],
 ) -> int:
-    container, state = _load_container(opts)
+    container, state = _ensure_and_save(opts, from_state=False, provision=True)
+    _sync_relays(container, state)
     cwd = _resolve_dir(opts.directory)
-    container.ensure(state, assume_yes=opts.yes, cwd=cwd, gui=opts.gui)
-    if not opts.dry_run:
-        paths.save_state(state)
-    container.restart_relays(mappings_from_state(state))
 
     if opts.gui and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         eprint("warning: --gui requested but no host DISPLAY or WAYLAND_DISPLAY is set.")
@@ -468,21 +494,21 @@ def _ensure_and_run(
 
 
 def _cmd_create(opts: CommonOptions, *, recreate: bool) -> int:
-    container, state = _load_container(opts)
-    cwd = _resolve_dir(opts.directory)
-    if recreate and container.exists() and not opts.dry_run:
-        container.request_recreate(
-            state,
-            cwd=cwd,
-            gui=opts.gui,
-            assume_yes=opts.yes,
-            reason="Recreate requested.",
-        )
-    else:
-        container.ensure(state, assume_yes=opts.yes, cwd=cwd, gui=opts.gui)
-    if not opts.dry_run:
-        paths.save_state(state)
-    container.restart_relays(mappings_from_state(state))
+    if recreate:
+        container, state = _load_container(opts)
+        if container.exists() and not opts.dry_run:
+            container.request_recreate(
+                state,
+                cwd=_resolve_dir(opts.directory),
+                gui=opts.gui,
+                assume_yes=opts.yes,
+                reason="Recreate requested.",
+            )
+            container.store.save(state)
+            _sync_relays(container, state)
+            return 0
+    container, state = _ensure_and_save(opts, from_state=False, provision=True)
+    _sync_relays(container, state)
     return 0
 
 
@@ -498,15 +524,15 @@ def _cmd_rm(opts: CommonOptions, *, purge: bool) -> int:
         eprint("Cancelled.")
         return 0
     container.remove(purge=purge)
-    state["applied_publish"] = []
-    paths.save_state(state)
+    state.applied_publish = []
+    container.store.save(state)
     return 0
 
 
 def _cmd_sync(opts: CommonOptions) -> int:
     container, state = _load_container(opts)
     container.provision()
-    container.restart_relays(mappings_from_state(state))
+    container.restart_relays(mappings_from_state({"ports": state.ports}))
     return 0
 
 
@@ -535,7 +561,7 @@ def _cmd_status(opts: CommonOptions) -> int:
         print(f"gui:       {'yes' if info['gui'] else 'no'}")
     if info.get("omp_version"):
         print(f"omp:       {info['omp_version']}")
-    mappings = mappings_from_state(state)
+    mappings = mappings_from_state({"ports": state.ports})
     print("ports:")
     if not mappings:
         print("  (none)")
@@ -546,7 +572,7 @@ def _cmd_status(opts: CommonOptions) -> int:
 
 def _cmd_ports_list(opts: CommonOptions) -> int:
     _container, state = _load_container(opts)
-    mappings = mappings_from_state(state)
+    mappings = mappings_from_state({"ports": state.ports})
     if not mappings:
         print("No port mappings configured.")
         return 0
@@ -570,7 +596,7 @@ def _cmd_ports_add(
     target_host: str,
 ) -> int:
     container_, state = _load_container(opts)
-    mappings = mappings_from_state(state)
+    mappings = mappings_from_state({"ports": state.ports})
     candidate = PortMapping(
         direction=direction,
         host=host,
@@ -593,8 +619,8 @@ def _cmd_ports_add(
 
     approved = approved_now(candidate)
     mappings.append(approved)
-    state["ports"] = mappings_to_state(mappings)
-    paths.save_state(state)
+    state.ports = mappings_to_state(mappings)
+    container_.store.save(state)
     eprint(f"Added {approved.id}")
 
     if container_.exists():
@@ -606,7 +632,7 @@ def _cmd_ports_add(
                 default=True,
             ):
                 container_.recreate(state, cwd=_state_cwd(state, opts), gui=_state_gui(state, opts))
-                paths.save_state(state)
+                container_.store.save(state)
         else:
             container_.provision()
             container_.restart_relays(mappings)
@@ -615,7 +641,7 @@ def _cmd_ports_add(
 
 def _cmd_ports_remove(opts: CommonOptions, mapping_id: str) -> int:
     container_, state = _load_container(opts)
-    mappings = mappings_from_state(state)
+    mappings = mappings_from_state({"ports": state.ports})
     match = next((mapping for mapping in mappings if mapping.id == mapping_id), None)
     if match is None:
         raise OmpKaliError(f"No port mapping with id {mapping_id!r}")
@@ -625,8 +651,8 @@ def _cmd_ports_remove(opts: CommonOptions, mapping_id: str) -> int:
         return 0
 
     mappings = [mapping for mapping in mappings if mapping.id != mapping_id]
-    state["ports"] = mappings_to_state(mappings)
-    paths.save_state(state)
+    state.ports = mappings_to_state(mappings)
+    container_.store.save(state)
     eprint(f"Removed {match.id}")
 
     if container_.exists():
@@ -637,7 +663,7 @@ def _cmd_ports_remove(opts: CommonOptions, mapping_id: str) -> int:
                 default=True,
             ):
                 container_.recreate(state, cwd=_state_cwd(state, opts), gui=_state_gui(state, opts))
-                paths.save_state(state)
+                container_.store.save(state)
             else:
                 eprint("warning: the port remains published until the container is recreated.")
         else:
@@ -646,22 +672,14 @@ def _cmd_ports_remove(opts: CommonOptions, mapping_id: str) -> int:
 
 
 def _cmd_provision(opts: CommonOptions, *, force: bool) -> int:
-    container, state = _load_container(opts)
-    cwd = _state_cwd(state, opts)
-    container.ensure(state, assume_yes=opts.yes, cwd=cwd, gui=_state_gui(state, opts), provision=not force)
-    if not opts.dry_run:
-        paths.save_state(state)
+    container, _state = _ensure_and_save(opts, from_state=True, provision=not force)
     if force:
         container.provision(force_hooks=True, force_mcp=True)
     return 0
 
 
 def _cmd_mcp_sync(opts: CommonOptions, *, force: bool) -> int:
-    container, state = _load_container(opts)
-    cwd = _state_cwd(state, opts)
-    container.ensure(state, assume_yes=opts.yes, cwd=cwd, gui=_state_gui(state, opts), provision=not force)
-    if not opts.dry_run:
-        paths.save_state(state)
+    container, _state = _ensure_and_save(opts, from_state=True, provision=not force)
     if force:
         container.provision(force_mcp=True)
     return 0

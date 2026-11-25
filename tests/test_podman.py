@@ -4,8 +4,9 @@ import subprocess
 import unittest
 from unittest import mock
 
-from omp_kali.errors import OmpKaliError
-from omp_kali.podman import CONTAINER, PODMAN, MANAGED_LABEL, RealPodman
+from omp_kali.core.errors import OmpKaliError
+from omp_kali.core.constants import CONTAINER, PODMAN, MANAGED_LABEL
+from omp_kali.infra.podman import RealPodman
 from tests.fakes import FakeRunner
 
 

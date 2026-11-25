@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from omp_kali.container import create_command
+from omp_kali.infra.create import create_command
 
 
 class CreateCommandTests(unittest.TestCase):

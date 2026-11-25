@@ -3,8 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from omp_kali.errors import OmpKaliError
-from omp_kali.mcp import (
+from omp_kali.core.errors import OmpKaliError
+from omp_kali.infra.mcp import (
     McpManifest,
     load_config,
     load_manifests,

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
 
 from .errors import OmpKaliError
 
@@ -21,8 +20,6 @@ DATA_DIR = Path(
 STATE_DIR = Path(
     os.environ.get("OMP_KALI_STATE_DIR", str(_xdg("XDG_STATE_HOME", ".local/state") / "omp-kali"))
 ).expanduser()
-
-STATE_FILE = Path(os.environ.get("OMP_KALI_STATE_FILE", str(STATE_DIR / "state.json"))).expanduser()
 
 SKILLS_DIR = "skills"
 AGENTS_DIR = "agents"
@@ -59,52 +56,6 @@ def repo_root() -> Path:
         "Cannot locate the omp-kali repository (skills/, agents/, mcp/). "
         "Set OMP_KALI_REPO to the checkout path."
     )
-
-
-def default_state() -> dict[str, Any]:
-    return {
-        "version": 1,
-        "workspace": "",
-        "gui": False,
-        "ports": [],
-        "applied_publish": [],
-    }
-
-
-def _state_path(path: Path | None) -> Path:
-    return path or STATE_FILE
-
-
-def load_state(path: Path | None = None) -> dict[str, Any]:
-    state_file = _state_path(path)
-    if not state_file.exists():
-        return default_state()
-    try:
-        raw = json.loads(state_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise OmpKaliError(f"Cannot read state file {state_file}: {exc}") from exc
-    if not isinstance(raw, dict):
-        raise OmpKaliError(f"State file {state_file} must contain a JSON object")
-    if raw.get("version") != 1:
-        raise OmpKaliError(f"Unsupported state version in {state_file}: {raw.get('version')!r}")
-    state = default_state()
-    state.update(raw)
-    state.pop("workspace_root", None)
-    if not isinstance(state.get("ports"), list):
-        raise OmpKaliError(f"State file {state_file}: ports must be a list")
-    if not isinstance(state.get("applied_publish"), list):
-        raise OmpKaliError(f"State file {state_file}: applied_publish must be a list")
-    return state
-
-
-def save_state(state: dict[str, Any], path: Path | None = None) -> None:
-    state_file = _state_path(path)
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    tmp = state_file.with_name(state_file.name + ".tmp")
-    payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
-    tmp.write_text(payload, encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, state_file)
 
 
 def ensure_repo_assets() -> tuple[Path, Path, Path, Path]:

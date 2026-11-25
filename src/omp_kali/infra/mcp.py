@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .errors import OmpKaliError
+from ..core.errors import OmpKaliError
 
 SCHEMA_URL = (
     "https://raw.githubusercontent.com/can1357/oh-my-pi/main/"
